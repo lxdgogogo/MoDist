@@ -6,17 +6,17 @@ import dgl.function as fn
 from dgl.nn.pytorch import GraphConv
 
 
-# 采用gated，而非简单加权
-class Distill_MOE_2(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, num_layers, teacher_logit, 
-                 teacher_embedding, graph, device, lambda1=0.5, lambda2=0.3):
-        super(Distill_MOE_2, self).__init__()
+class Distill_MOE_conf(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, num_layers, teacher_logit,
+                 device, lambda1=0.5, lambda2=0.3, tau=1):
+        super(Distill_MOE_conf, self).__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.output_size = output_size
         self.num_layers = num_layers
-        self.graph = graph
         self.device = device
+        self.dropout = 0.5
+        self.tau = tau
 
         # single MLP
         self.single_MLP = nn.ModuleList()
@@ -49,189 +49,67 @@ class Distill_MOE_2(nn.Module):
         self.heterophilic_MLP = nn.Sequential(*self.heterophilic_MLP)
 
         self.gated = nn.Sequential(nn.Linear(input_size, 3), nn.Softmax(dim=1))
-        self.final_layer = nn.ModuleList()
-        for _ in range(3):
-            self.final_layer.append(nn.Linear(hidden_size, output_size))
+        self.final_layer = nn.Linear(hidden_size, output_size)
         self.batch_norm = torch.nn.BatchNorm1d(input_size)
         self.softmax = nn.Softmax(dim=1)
         self.teacher_logit = teacher_logit.detach()
-        self.teacher_embedding = F.normalize(teacher_embedding, dim=1).detach()
 
         self.lambda1 = lambda1
         self.lambda2 = lambda2
-        self.loss1 = nn.KLDivLoss(reduction="batchmean") # KL divergence loss
+        self.loss1 = nn.KLDivLoss(reduction="batchmean")  # KL divergence loss
         self.loss2 = nn.CrossEntropyLoss()
-        # self.loss3 = nn.KLDivLoss(reduction="batchmean")
-    
 
-    def homophilic_embedding(self, feature):
-        self.graph.ndata['x'] = feature
-        self.graph.update_all(fn.copy_src(src='x', out='m'), fn.mean(msg='m', out='h'))
-        h = self.graph.ndata["h"].to(torch.float32)
+    def homophilic_embedding(self, graph, feature):
+        graph.ndata['x'] = feature
+        graph.update_all(fn.copy_src(src='x', out='m'), fn.mean(msg='m', out='h'))
+        h = graph.ndata["h"].to(torch.float32)
         h = self.homophilic_MLP(h)
         return h
 
-    def heterophilic_embedding(self, feature):
-        self.graph.ndata['x'] = feature
-        self.graph.update_all(fn.copy_src(src='x', out='m'), fn.mean(msg='m', out='h'))
-        # self.graph.ndata["h"] = torch.div(self.graph.ndata["h"], self.graph.in_degrees().unsqueeze(1))
-        h = self.graph.ndata["feature"] -  self.graph.ndata["h"]
+    def heterophilic_embedding(self, graph, feature):
+        graph.ndata['x'] = feature
+        graph.update_all(fn.copy_src(src='x', out='m'), fn.mean(msg='m', out='h'))
+        # graph.ndata["h"] = torch.div(graph.ndata["h"], graph.in_degrees().unsqueeze(1))
+        h = graph.ndata["feature"] - graph.ndata["h"]
         h = self.heterophilic_MLP(h)
         return h
 
-    def gated_fusion(self, h_homophilic, h_heterophilic, h_single, k=3):
-        feature = self.graph.ndata['feature']
-        # confidence_ori = self.gated(h_single)
+    def gated_fusion(self, graph, h_homophilic, h_heterophilic, h_single, k=2):
+        feature = graph.ndata['feature']
         confidence_ori = self.gated(feature)
         _, sort_idx = torch.sort(confidence_ori, dim=1, descending=True)
         sort_idx = sort_idx[:, :k]
-
-        h_list = [h_homophilic, h_heterophilic, h_single]
-        logit_list = []  # N * 3 * C
-        for i, h in enumerate(h_list):
-            h = self.final_layer[i](h)
-            logit_single = self.softmax(h)
-            logit_list.append(logit_single)
-        logit_student = torch.stack(logit_list, dim=1)  # N * 3 * C
-       
-        # confidence_k = confidence.gather(1, sort_idx)  # N * k
-        mask = torch.ones_like(confidence_ori, dtype=torch.float) * (-1e5) # N * 3
-        mask.scatter_(1, sort_idx, 1)  # scatter 到第1维
+        embedding_student = torch.stack([h_homophilic, h_heterophilic, h_single], dim=1)  # N * 3 * D
+        mask = torch.ones_like(confidence_ori, dtype=torch.float) * (-1e5)  # N * 3
+        mask.scatter_(1, sort_idx, 1)
         confidence_masked = confidence_ori * mask
-        confidence = F.softmax(confidence_masked, dim=1)  # N * 3        
-        
-        logit_student = logit_student * confidence.unsqueeze(-1) # N * 3 * C
-        logit_student = logit_student.sum(dim=1) # N * C
+        confidence = F.softmax(confidence_masked, dim=1)  # N * 3
 
-        return logit_student, confidence
+        embedding_student = embedding_student * confidence.unsqueeze(-1)  # N * 3 * D
+        embedding_student = embedding_student.sum(dim=1)  # N * D
+
+        return embedding_student, confidence
 
     def auxilary_loss(self, confidence):
         penalty_each = torch.mean(confidence, dim=0)
-        aux_loss = torch.sum(torch.abs(penalty_each - (1.0 / confidence.shape[1]) ) )
-        # penalty = torch.abs(confidence - 1.0 / (confidence.shape[1]))
-        # aux_loss = torch.mean(penalty)
+        aux_loss = torch.sum(torch.abs(penalty_each - (1.0 / confidence.shape[1])))
         return aux_loss
 
-    def forward(self, feature, label, train_nodes):
+    def forward(self, graph, feature, label, train_nodes, train=True):
         h = self.batch_norm(feature)
-        h_homophilic = self.homophilic_embedding(h)
-        h_heterophilic = self.heterophilic_embedding(h)
+        h_homophilic = self.homophilic_embedding(graph, h)
+        h_heterophilic = self.heterophilic_embedding(graph, h)
         h_single = self.single_MLP(h)
-        logit_student, confidence = self.gated_fusion(h_homophilic, h_heterophilic, h_single)
-        loss1 = self.loss1(self.teacher_logit, logit_student)
+        embedding_student, confidence = self.gated_fusion(graph, h_homophilic, h_heterophilic, h_single)
+        logit_student = self.final_layer(embedding_student)
+        logit_student = self.softmax(logit_student)
+        if not train:
+            confidence_1 = confidence.clone()
+            confidence_1[confidence != 0] = 1
+            confidence_1[confidence == 0] = 0
+            return logit_student, 0
+        loss1 = self.loss1(self.teacher_logit / self.tau, logit_student / self.tau)
         loss2 = self.loss2(logit_student[train_nodes], label[train_nodes])
         confidence_penalty = self.auxilary_loss(confidence)
         loss = self.lambda1 * loss1 + (1 - self.lambda1) * loss2 + confidence_penalty * self.lambda2
         return logit_student, loss
-    
-    def eval(self, feature):
-        h = self.batch_norm(feature)
-        h_homophilic = self.homophilic_embedding(h)
-        h_heterophilic = self.heterophilic_embedding(h)
-        h_single = self.single_MLP(h)
-        logit_student, confidence = self.gated_fusion(h_homophilic, h_heterophilic, h_single)
-        return logit_student
-
-
-# 简化版的MoE
-class Distill_MOE_3(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, num_layers, teacher_logit, 
-                 teacher_embedding, graph, device, lambda1=0.5, lambda2=0.3):
-        super(Distill_MOE_3, self).__init__()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.output_size = output_size
-        self.num_layers = num_layers
-        self.graph = graph
-        self.device = device
-
-        # single MLP
-        self.single_MLP = nn.ModuleList()
-        self.single_MLP.append(nn.Linear(input_size, hidden_size))
-        self.single_MLP.append(torch.nn.ReLU())
-        for _ in range(num_layers):
-            self.single_MLP.append(nn.Linear(hidden_size, hidden_size))
-            self.single_MLP.append(torch.nn.ReLU())
-        self.single_MLP = nn.Sequential(*self.single_MLP)
-        # homophilic MLP
-        # self.homophilic_message = GraphConv(input_size, hidden_size, weight=False, bias=False)
-        self.homophilic_MLP = nn.ModuleList()
-        self.homophilic_MLP.append(nn.Linear(input_size, hidden_size))
-        self.homophilic_MLP.append(torch.nn.ReLU())
-        for _ in range(num_layers):
-            self.homophilic_MLP.append(nn.Linear(hidden_size, hidden_size))
-            self.homophilic_MLP.append(torch.nn.ReLU())
-        self.homophilic_MLP = nn.Sequential(*self.homophilic_MLP)
-
-        # heterophilic MLP
-        # self.heterophilic_message = GraphConv(input_size, hidden_size, weight=False, bias=False)
-        self.heterophilic_MLP = nn.ModuleList()
-        self.heterophilic_MLP.append(nn.Linear(input_size, hidden_size))
-        self.heterophilic_MLP.append(torch.nn.ReLU())
-        for _ in range(num_layers):
-            self.heterophilic_MLP.append(nn.Linear(hidden_size, hidden_size))
-            self.heterophilic_MLP.append(torch.nn.ReLU())
-        self.heterophilic_MLP = nn.Sequential(*self.heterophilic_MLP)
-
-        self.gated = nn.Sequential(nn.Linear(input_size, 3), nn.Softmax(dim=1))
-        self.final_layer = nn.Linear(hidden_size, output_size)
-        self.norm = torch.nn.BatchNorm1d(output_size)
-        self.softmax = nn.Softmax(dim=1)
-        self.teacher_logit = teacher_logit.detach()
-        self.teacher_embedding = F.normalize(teacher_embedding, dim=1).detach()
-
-        self.lambda1 = lambda1
-        self.lambda2 = lambda2
-        self.loss1 = nn.KLDivLoss(reduction="batchmean") # KL divergence loss
-        self.loss2 = nn.CrossEntropyLoss()
-        self.loss3 = nn.KLDivLoss(reduction="batchmean")
-    
-
-    def homophilic_embedding(self, feature):
-        self.graph.ndata['x'] = feature
-        self.graph.update_all(fn.copy_src(src='x', out='m'), fn.mean(msg='m', out='h'))
-        h = self.graph.ndata["h"]
-        h = self.homophilic_MLP(h)
-        return h
-
-    def heterophilic_embedding(self, feature):
-        self.graph.ndata['x'] = feature
-        self.graph.update_all(fn.copy_src(src='x', out='m'), fn.mean(msg='m', out='h'))
-        # self.graph.ndata["h"] = torch.div(self.graph.ndata["h"], self.graph.in_degrees().unsqueeze(1))
-        h = feature -  self.graph.ndata["h"]
-        h = self.heterophilic_MLP(h)
-        return h
-
-    def gated_fusion(self, h_homophilic, h_heterophilic, h_single, k=2):
-        confidence_ori = self.gated(self.graph.ndata['feature'])
-        _, sort_idx = torch.sort(confidence_ori, dim=1, descending=True)
-        sort_idx = sort_idx[:, :k]
-
-        h_list = [h_homophilic, h_heterophilic, h_single]
-        h = torch.stack(h_list, dim=-1)  # N * D * 3
-
-        
-        # confidence_k = confidence.gather(1, sort_idx)  # N * k
-        mask = torch.ones_like(confidence_ori, dtype=torch.float) * (-1e5) # N * 3
-        mask.scatter_(1, sort_idx, 1)  # scatter 到第1维
-        confidence_masked = confidence_ori * mask
-        confidence = F.softmax(confidence_masked, dim=1)  # N * 3 * 1
-
-        h = torch.matmul(h, confidence.unsqueeze(-1)) # N * D * 3
-        h = h.squeeze(-1)  # N * D
-
-        logit_student = self.final_layer(h)  # N * C
-        logit_student = self.softmax(logit_student)
-        return logit_student
-
-    def forward(self, feature, label, train_nodes):
-        h = feature
-        h_homophilic = self.homophilic_embedding(h)
-        h_heterophilic = self.heterophilic_embedding(h)
-        h_single = self.single_MLP(h)
-        logit_student = self.gated_fusion(h_homophilic, h_heterophilic, h_single)
-        loss1 = self.loss1(self.teacher_logit, logit_student)
-        loss2 = self.loss2(logit_student[train_nodes], label[train_nodes])
-        loss = self.lambda1 * loss1 + (1 - self.lambda1) * loss2
-        return logit_student, loss
-
