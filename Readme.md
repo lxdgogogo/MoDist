@@ -30,7 +30,7 @@ Train Teacher Model:
 ```
 cd Global
 
-python pretrain_teacher.py --dataset cora --epoch 100 --num_layers_teacher 2 \
+python pretrain_teacher.py --dataset amazon_ratings --epoch 100 --num_layers_teacher 2 \
 --dropout 0.6 --hidden_size 128 --device cuda
 ```
 
@@ -39,7 +39,7 @@ Train Student Model:
 
 ```
 
-python distill_more.py --dataset cora --num_layers_teacher 2 --num_layers_student 2 \
+python distill_more.py --dataset amazon_ratings --num_layers_teacher 2 --num_layers_student 2 \
 --num_heads 8 --lambda1 0.3 --lambda2 0.4 --tau 1.0 --hidden_size 128 --dropout 0.6
 
 

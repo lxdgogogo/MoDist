@@ -16,7 +16,7 @@ from utils.eval_model import eval_acc, eval_f1
 
 def parse_args():
     parser = ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="cora")
+    parser.add_argument("--dataset", type=str, default="amazon_ratings")
     parser.add_argument("--num_layers_teacher", type=int, default=2)
     parser.add_argument("--num_layers_student", type=int, default=2)
     parser.add_argument("--num_heads", type=int, default=8)
